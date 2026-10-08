@@ -1,11 +1,285 @@
+
 pipeline {
     agent any
 
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'uat', 'prod'],
+            description: 'Select the environment to modify'
+        )
+
+        choice(
+            name: 'PARAMETER',
+            choices: [
+                'version',
+                'replicas',
+                'logLevel',
+                'database.host',
+                'database.port',
+                'database.name',
+                'resources.cpu',
+                'resources.memory',
+                'features.debug',
+                'features.maintenanceMode'
+            ],
+            description: 'Select the JSON parameter to modify'
+        )
+
+        string(
+            name: 'VALUE',
+            description: 'Enter the new value'
+        )
+    }
+
+    environment {
+        REPO = 'Nikhilreddy0549/flipkart'
+        FEATURE_BRANCH = 'feature'
+        MAIN_BRANCH = 'main'
+    }
+
     stages {
-        stage('Environment Pipeline') {
+
+        stage('Checkout feature') {
             steps {
-                echo 'Environment pipeline'
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/feature']],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:Nikhilreddy0549/flipkart.git',
+                        credentialsId: 'github-ssh'
+                    ]]
+                ])
             }
+        }
+
+        stage('Modify selected JSON') {
+            steps {
+                sh '''
+                    python validation/modify_environment.py \
+                        "environment/${ENVIRONMENT}.json" \
+                        "${PARAMETER}" \
+                        "${VALUE}"
+                '''
+            }
+        }
+
+        stage('JSON Syntax Validation') {
+            steps {
+                sh '''
+                    python -m json.tool \
+                        "environment/${ENVIRONMENT}.json" \
+                        > /dev/null
+                '''
+            }
+        }
+
+        stage('Environment Validation') {
+            steps {
+                sh '''
+                    python validation/validate_environment.py \
+                        "environment/${ENVIRONMENT}.json" \
+                        "${ENVIRONMENT}"
+                '''
+            }
+        }
+
+        stage('Maven Build') {
+            steps {
+                sh 'mvn clean test'
+            }
+        }
+
+        stage('Code Quality') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    withCredentials([
+                        string(
+                            credentialsId: 'sonarqube-token',
+                            variable: 'SONAR_TOKEN'
+                        )
+                    ]) {
+                        sh '''
+                            mvn org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
+                                -Dsonar.token="$SONAR_TOKEN"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Nexus') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'nexus-credentials',
+                        usernameVariable: 'NEXUS_USERNAME',
+                        passwordVariable: 'NEXUS_PASSWORD'
+                    )
+                ]) {
+                    configFileProvider([
+                        configFile(
+                            fileId: 'nexus-maven-settings',
+                            variable: 'MAVEN_SETTINGS'
+                        )
+                    ]) {
+                        sh '''
+                            mvn deploy -s "$MAVEN_SETTINGS"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Commit') {
+            steps {
+                sh '''
+                    git config user.name "Jenkins"
+                    git config user.email "jenkins@localhost"
+
+                    git add "environment/${ENVIRONMENT}.json"
+
+                    if ! git diff --cached --quiet; then
+                        git commit \
+                            -m "Update ${ENVIRONMENT} environment configuration"
+                    else
+                        echo "No configuration changes to commit."
+                    fi
+                '''
+            }
+        }
+
+        stage('Push feature') {
+            steps {
+                sshagent(['github-ssh']) {
+                    sh '''
+                        git push origin HEAD:feature
+                    '''
+                }
+            }
+        }
+
+        stage('Create PR') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        if gh pr view feature \
+                            --repo "$REPO" \
+                            >/dev/null 2>&1; then
+                            echo "Pull request already exists for feature."
+                        else
+                            gh pr create \
+                                --repo "$REPO" \
+                                --base "$MAIN_BRANCH" \
+                                --head "$FEATURE_BRANCH" \
+                                --title "Update ${ENVIRONMENT} environment configuration" \
+                                --body "Automated configuration update for ${ENVIRONMENT} environment."
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('PR Validation') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        PR_URL=$(gh pr view feature \
+                            --repo "$REPO" \
+                            --json url \
+                            --jq '.url')
+
+                        echo "Validating PR: $PR_URL"
+
+                        PR_STATE=$(gh pr view "$PR_URL" \
+                            --repo "$REPO" \
+                            --json state \
+                            --jq '.state')
+
+                        if [ "$PR_STATE" != "OPEN" ]; then
+                            echo "ERROR: Pull request is not open."
+                            exit 1
+                        fi
+
+                        MERGEABLE=$(gh pr view "$PR_URL" \
+                            --repo "$REPO" \
+                            --json mergeable \
+                            --jq '.mergeable')
+
+                        if [ "$MERGEABLE" != "MERGEABLE" ]; then
+                            echo "ERROR: Pull request is not currently mergeable."
+                            exit 1
+                        fi
+
+                        echo "PR validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Auto Merge') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        PR_URL=$(gh pr view feature \
+                            --repo "$REPO" \
+                            --json url \
+                            --jq '.url')
+
+                        gh pr merge "$PR_URL" \
+                            --repo "$REPO" \
+                            --merge
+
+                        echo "Pull request merged into main."
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Review the stage logs before retrying.'
+        }
+
+        aborted {
+            echo 'Pipeline was aborted.'
         }
     }
 }
