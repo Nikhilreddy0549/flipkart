@@ -1,10 +1,162 @@
 pipeline {
     agent any
 
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'stage', 'uat', 'prod'],
+            description: 'Select the environment to modify'
+        )
+
+        choice(
+            name: 'PARAMETER',
+            choices: [
+                'version',
+                'replicas',
+                'logLevel',
+                'database.host',
+                'database.port',
+                'database.name',
+                'resources.cpu',
+                'resources.memory',
+                'features.debug',
+                'features.maintenanceMode'
+            ],
+            description: 'Select the JSON parameter to modify'
+        )
+
+        string(
+            name: 'VALUE',
+            description: 'Enter the new value'
+        )
+    }
+
     stages {
-        stage('Environment Pipeline') {
+
+        stage('Checkout feature') {
             steps {
-                echo 'Environment pipeline'
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/feature']],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:Nikhilreddy0549/flipkart.git',
+                        credentialsId: 'github-ssh'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Modify selected JSON') {
+            steps {
+                sh """
+                    python validation/modify_environment.py \
+                        environment/${params.ENVIRONMENT}.json \
+                        '${params.PARAMETER}' \
+                        '${params.VALUE}'
+                """
+            }
+        }
+
+        stage('JSON Syntax Validation') {
+            steps {
+                sh """
+                    python -m json.tool \
+                        environment/${params.ENVIRONMENT}.json \
+                        > /dev/null
+                """
+            }
+        }
+
+        stage('Environment Validation') {
+            steps {
+                sh """
+                    python validation/validate_environment.py \
+                        environment/${params.ENVIRONMENT}.json \
+                        ${params.ENVIRONMENT}
+                """
+            }
+        }
+
+        stage('Maven Build') {
+            steps {
+                sh 'mvn clean test'
+            }
+        }
+
+        stage('Code Quality') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh 'mvn sonar:sonar'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Nexus') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'nexus-credentials',
+                        usernameVariable: 'NEXUS_USERNAME',
+                        passwordVariable: 'NEXUS_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        mvn deploy \
+                            -Dnexus.username="$NEXUS_USERNAME" \
+                            -Dnexus.password="$NEXUS_PASSWORD"
+                    '''
+                }
+            }
+        }
+
+        stage('Commit') {
+            steps {
+                sh '''
+                    git config user.name "Jenkins"
+                    git config user.email "jenkins@localhost"
+
+                    git add environment/${ENVIRONMENT}.json
+
+                    git commit \
+                        -m "Update ${ENVIRONMENT} environment configuration" \
+                        || true
+                '''
+            }
+        }
+
+        stage('Push feature') {
+            steps {
+                sh '''
+                    git push origin HEAD:feature
+                '''
+            }
+        }
+
+        stage('Create PR') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        gh pr create \
+                            --repo Nikhilreddy0549/flipkart \
+                            --base main \
+                            --head feature \
+                            --title "Update ${ENVIRONMENT} environment configuration" \
+                            --body "Automated configuration update for ${ENVIRONMENT} environment."
+                    '''
+                }
             }
         }
     }
