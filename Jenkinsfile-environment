@@ -89,7 +89,14 @@ pipeline {
                     sh 'mvn sonar:sonar'
                 }
             }
+        }stage('Code Quality') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh 'mvn sonar:sonar'
+                }
+            }
         }
+
 
         stage('Quality Gate') {
             steps {
@@ -168,3 +175,4 @@ pipeline {
         }
     }
 }
+
