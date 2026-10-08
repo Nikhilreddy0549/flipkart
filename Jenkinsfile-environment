@@ -1,5 +1,11 @@
+
 pipeline {
     agent any
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+    }
 
     parameters {
         choice(
@@ -31,6 +37,12 @@ pipeline {
         )
     }
 
+    environment {
+        REPO = 'Nikhilreddy0549/flipkart'
+        FEATURE_BRANCH = 'feature'
+        MAIN_BRANCH = 'main'
+    }
+
     stages {
 
         stage('Checkout feature') {
@@ -48,32 +60,32 @@ pipeline {
 
         stage('Modify selected JSON') {
             steps {
-                sh """
+                sh '''
                     python validation/modify_environment.py \
-                        environment/${params.ENVIRONMENT}.json \
-                        '${params.PARAMETER}' \
-                        '${params.VALUE}'
-                """
+                        "environment/${ENVIRONMENT}.json" \
+                        "${PARAMETER}" \
+                        "${VALUE}"
+                '''
             }
         }
 
         stage('JSON Syntax Validation') {
             steps {
-                sh """
+                sh '''
                     python -m json.tool \
-                        environment/${params.ENVIRONMENT}.json \
+                        "environment/${ENVIRONMENT}.json" \
                         > /dev/null
-                """
+                '''
             }
         }
 
         stage('Environment Validation') {
             steps {
-                sh """
+                sh '''
                     python validation/validate_environment.py \
-                        environment/${params.ENVIRONMENT}.json \
-                        ${params.ENVIRONMENT}
-                """
+                        "environment/${ENVIRONMENT}.json" \
+                        "${ENVIRONMENT}"
+                '''
             }
         }
 
@@ -138,11 +150,14 @@ pipeline {
                     git config user.name "Jenkins"
                     git config user.email "jenkins@localhost"
 
-                    git add environment/${ENVIRONMENT}.json
+                    git add "environment/${ENVIRONMENT}.json"
 
-                    git commit \
-                        -m "Update ${ENVIRONMENT} environment configuration" \
-                        || true
+                    if ! git diff --cached --quiet; then
+                        git commit \
+                            -m "Update ${ENVIRONMENT} environment configuration"
+                    else
+                        echo "No configuration changes to commit."
+                    fi
                 '''
             }
         }
@@ -166,15 +181,105 @@ pipeline {
                     )
                 ]) {
                     sh '''
-                        gh pr create \
-                            --repo Nikhilreddy0549/flipkart \
-                            --base main \
-                            --head feature \
-                            --title "Update ${ENVIRONMENT} environment configuration" \
-                            --body "Automated configuration update for ${ENVIRONMENT} environment."
+                        if gh pr view feature \
+                            --repo "$REPO" \
+                            >/dev/null 2>&1; then
+                            echo "Pull request already exists for feature."
+                        else
+                            gh pr create \
+                                --repo "$REPO" \
+                                --base "$MAIN_BRANCH" \
+                                --head "$FEATURE_BRANCH" \
+                                --title "Update ${ENVIRONMENT} environment configuration" \
+                                --body "Automated configuration update for ${ENVIRONMENT} environment."
+                        fi
                     '''
                 }
             }
+        }
+
+        stage('PR Validation') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        PR_URL=$(gh pr view feature \
+                            --repo "$REPO" \
+                            --json url \
+                            --jq '.url')
+
+                        echo "Validating PR: $PR_URL"
+
+                        PR_STATE=$(gh pr view "$PR_URL" \
+                            --repo "$REPO" \
+                            --json state \
+                            --jq '.state')
+
+                        if [ "$PR_STATE" != "OPEN" ]; then
+                            echo "ERROR: Pull request is not open."
+                            exit 1
+                        fi
+
+                        MERGEABLE=$(gh pr view "$PR_URL" \
+                            --repo "$REPO" \
+                            --json mergeable \
+                            --jq '.mergeable')
+
+                        if [ "$MERGEABLE" != "MERGEABLE" ]; then
+                            echo "ERROR: Pull request is not currently mergeable."
+                            exit 1
+                        fi
+
+                        echo "PR validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Auto Merge') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        PR_URL=$(gh pr view feature \
+                            --repo "$REPO" \
+                            --json url \
+                            --jq '.url')
+
+                        gh pr merge "$PR_URL" \
+                            --repo "$REPO" \
+                            --merge
+
+                        echo "Pull request merged into main."
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Review the stage logs before retrying.'
+        }
+
+        aborted {
+            echo 'Pipeline was aborted.'
         }
     }
 }
