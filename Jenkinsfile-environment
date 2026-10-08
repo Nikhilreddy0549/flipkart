@@ -108,11 +108,16 @@ pipeline {
                         passwordVariable: 'NEXUS_PASSWORD'
                     )
                 ]) {
-                    sh '''
-                        mvn deploy \
-                            -Dnexus.username="$NEXUS_USERNAME" \
-                            -Dnexus.password="$NEXUS_PASSWORD"
-                    '''
+                    configFileProvider([
+                        configFile(
+                            fileId: 'nexus-maven-settings',
+                            variable: 'MAVEN_SETTINGS'
+                        )
+                    ]) {
+                        sh '''
+                            mvn deploy -s "$MAVEN_SETTINGS"
+                        '''
+                    }
                 }
             }
         }
