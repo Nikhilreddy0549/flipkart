@@ -134,9 +134,11 @@ pipeline {
 
         stage('Push feature') {
             steps {
-                sh '''
-                    git push origin HEAD:feature
-                '''
+                sshagent(['github-ssh']) {
+                    sh '''
+                        git push origin HEAD:feature
+                    '''
+                }
             }
         }
 
