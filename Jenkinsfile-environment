@@ -10,122 +10,128 @@ pipeline {
         choice(
             name: 'CONFIG_TYPE',
             choices: ['environment', 'node'],
-            description: 'Select the configuration type to update'
+            description: 'Select which configuration to update'
         )
+
         choice(
             name: 'ENVIRONMENT',
             choices: ['dev', 'stage', 'uat', 'prod'],
             description: 'Select the target environment'
         )
+
         string(
             name: 'CONFIG_KEY',
             defaultValue: 'appName',
             description: 'JSON key to update'
         )
+
         string(
             name: 'CONFIG_VALUE',
             defaultValue: 'flipkart',
-            description: 'New value for the selected JSON key'
+            description: 'New value for the JSON key'
         )
     }
 
     environment {
         GITHUB_REPO = 'Nikhilreddy0549/flipkart'
-        GIT_BRANCH = 'feature'
+        GITHUB_BRANCH = 'feature'
         TARGET_BRANCH = 'main'
-        SONAR_PROJECT_KEY = 'flipkart-config-automation'
-        NEXUS_URL = 'http://localhost:8082/repository/maven-snapshots/'
+        SONARQUBE_PROJECT_KEY = 'flipkart'
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                git branch: 'feature',
-                    credentialsId: 'github-ssh',
-                    url: 'git@github.com:Nikhilreddy0549/flipkart.git'
-
-                sh '''
-                    set -eu
-                    git checkout feature
-                    git config user.name "Jenkins"
-                    git config user.email "jenkins@localhost"
-                    echo "Checked out feature branch."
-                '''
+                git(
+                    url: 'git@github.com:Nikhilreddy0549/flipkart.git',
+                    branch: 'feature',
+                    credentialsId: 'github-ssh'
+                )
             }
         }
 
-        stage('Modify Configuration') {
+        stage('Update Configuration') {
             steps {
                 script {
+                    def configDirectory =
+                        params.CONFIG_TYPE == 'environment'
+                        ? 'environment'
+                        : 'node'
+
                     env.CONFIG_FILE =
-                        "${params.CONFIG_TYPE}/${params.ENVIRONMENT}.json"
+                        "${configDirectory}/${params.ENVIRONMENT}.json"
 
-                    if (params.CONFIG_TYPE == 'environment') {
-                        env.VALIDATOR = 'validation/validate_environment.py'
-                    } else {
-                        env.VALIDATOR = 'validation/validate_node.py'
-                    }
-                }
+                    env.VALIDATOR =
+                        params.CONFIG_TYPE == 'environment'
+                        ? 'validation/validate_environment.py'
+                        : 'validation/validate_node.py'
 
-                sh '''
-                    set -eu
-
-                    test -f "$CONFIG_FILE" || {
-                        echo "Configuration file not found: $CONFIG_FILE"
-                        exit 1
+                    if (!fileExists(env.CONFIG_FILE)) {
+                        error("Configuration file not found: ${env.CONFIG_FILE}")
                     }
 
-                    python3 - "$CONFIG_FILE" "$CONFIG_KEY" "$CONFIG_VALUE" <<'PY'
+                    if (!fileExists(env.VALIDATOR)) {
+                        error("Validator not found: ${env.VALIDATOR}")
+                    }
+
+                    withEnv([
+                        "CONFIG_FILE=${env.CONFIG_FILE}",
+                        "CONFIG_KEY=${params.CONFIG_KEY}",
+                        "CONFIG_VALUE=${params.CONFIG_VALUE}"
+                    ]) {
+                        sh '''
+                            python3 - <<'PY'
 import json
-import sys
+import os
 
-file_path, key, value = sys.argv[1:4]
+file_path = os.environ["CONFIG_FILE"]
+key = os.environ["CONFIG_KEY"]
+raw_value = os.environ["CONFIG_VALUE"]
+
+try:
+    value = json.loads(raw_value)
+except json.JSONDecodeError:
+    value = raw_value
 
 with open(file_path, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-try:
-    parsed_value = json.loads(value)
-except json.JSONDecodeError:
-    parsed_value = value
-
-data[key] = parsed_value
+data[key] = value
 
 with open(file_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\\n")
 
-print(f"Updated {key} in {file_path}")
+print("Updated configuration file:", file_path)
+print("Updated key:", key)
 PY
-                '''
+                        '''
+                    }
+                }
             }
         }
 
-        stage('JSON Syntax Validation') {
+        stage('Validate JSON') {
             steps {
                 sh '''
-                    set -eu
                     python3 -m json.tool "$CONFIG_FILE" > /dev/null
                     echo "JSON syntax validation passed."
                 '''
             }
         }
 
-        stage('Environment / Node Validation') {
+        stage('Run Configuration Validator') {
             steps {
                 sh '''
-                    set -eu
                     python3 "$VALIDATOR" "$CONFIG_FILE" "$ENVIRONMENT"
-                    echo "Configuration validation passed."
                 '''
             }
         }
 
-        stage('Maven Build and Tests') {
+        stage('Maven Build and Test') {
             steps {
                 sh '''
-                    set -eu
                     mvn clean test
                 '''
             }
@@ -133,19 +139,18 @@ PY
 
         stage('SonarQube Analysis') {
             steps {
-                withSonarQubeEnv('SonarQube') {
-                    withCredentials([
-                        string(
-                            credentialsId: 'sonarqube-token',
-                            variable: 'SONAR_TOKEN'
-                        )
-                    ]) {
+                withCredentials([
+                    string(
+                        credentialsId: 'sonarqube-token',
+                        variable: 'SONAR_TOKEN'
+                    )
+                ]) {
+                    withSonarQubeEnv('SonarQube') {
                         sh '''
-                            set -eu
-
-                            mvn org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
-                                -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
-                                -Dsonar.token="$SONAR_TOKEN"
+                            mvn sonar:sonar \
+                              -Dsonar.projectKey=flipkart \
+                              -Dsonar.host.url=http://172.31.8.21:9000 \
+                              -Dsonar.token="$SONAR_TOKEN"
                         '''
                     }
                 }
@@ -157,12 +162,10 @@ PY
                 timeout(time: 10, unit: 'MINUTES') {
                     script {
                         def qualityGate = waitForQualityGate()
-
-                        echo "SonarQube Quality Gate: ${qualityGate.status}"
-
                         if (qualityGate.status != 'OK') {
-                            error "Quality Gate failed: ${qualityGate.status}"
+                            error("SonarQube Quality Gate failed: ${qualityGate.status}")
                         }
+                        echo 'SonarQube Quality Gate passed.'
                     }
                 }
             }
@@ -179,12 +182,11 @@ PY
                 ]) {
                     configFileProvider([
                         configFile(
-                            fileId: 'nexus-maven-settings',
+                            fileId: 'MySettings',
                             variable: 'MAVEN_SETTINGS'
                         )
                     ]) {
                         sh '''
-                            set -eu
                             mvn -s "$MAVEN_SETTINGS" deploy -DskipTests
                         '''
                     }
@@ -194,90 +196,34 @@ PY
 
         stage('Commit Changes') {
             steps {
-                sh '''
-                    set -eu
+                script {
+                    sh '''
+                        git config user.name "Jenkins"
+                        git config user.email "jenkins@localhost"
 
-                    git add "$CONFIG_FILE"
+                        git add "$CONFIG_FILE"
 
-                    if git diff --cached --quiet; then
-                        echo "No configuration changes to commit."
-                    else
-                        git commit -m "Update ${ENVIRONMENT} ${CONFIG_TYPE} configuration"
-                    fi
-                '''
+                        if git diff --cached --quiet; then
+                            echo "No configuration changes to commit."
+                        else
+                            git commit -m "Update ${CONFIG_FILE}: ${CONFIG_KEY}"
+                        fi
+                    '''
+                }
             }
         }
 
-        stage('Push feature') {
+        stage('Push Feature Branch') {
             steps {
                 sshagent(credentials: ['github-ssh']) {
                     sh '''
-                        set -eu
                         git push origin HEAD:feature
-                        echo "Changes pushed to feature."
                     '''
                 }
             }
         }
 
-        stage('Create or Find Open PR') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'github-token',
-                        variable: 'GH_TOKEN'
-                    )
-                ]) {
-                    script {
-                        env.PR_NUMBER = sh(
-                            script: '''
-                                set -eu
-                                export GH_TOKEN
-
-                                gh pr list \
-                                    --repo "$GITHUB_REPO" \
-                                    --base "$TARGET_BRANCH" \
-                                    --head "$GIT_BRANCH" \
-                                    --state open \
-                                    --json number \
-                                    --jq '.[0].number // empty'
-                            ''',
-                            returnStdout: true
-                        ).trim()
-
-                        if (env.PR_NUMBER) {
-                            echo "Using existing open PR #${env.PR_NUMBER}"
-                        } else {
-                            echo "No open PR found. Creating a new PR."
-
-                            env.PR_NUMBER = sh(
-                                script: '''
-                                    set -eu
-                                    export GH_TOKEN
-
-                                    gh pr create \
-                                        --repo "$GITHUB_REPO" \
-                                        --base "$TARGET_BRANCH" \
-                                        --head "$GIT_BRANCH" \
-                                        --title "Automated configuration update" \
-                                        --body "Configuration changes generated and validated by Jenkins."
-                                ''',
-                                returnStdout: true
-                            ).trim().tokenize('/').last()
-
-                            echo "Created PR #${env.PR_NUMBER}"
-                        }
-
-                        env.PR_URL =
-                            "https://github.com/${env.GITHUB_REPO}/pull/${env.PR_NUMBER}"
-
-                        echo "Pull request URL: ${env.PR_URL}"
-                    }
-                }
-            }
-        }
-
-        stage('PR Validation') {
+        stage('Create or Find Pull Request') {
             steps {
                 withCredentials([
                     string(
@@ -287,62 +233,35 @@ PY
                 ]) {
                     sh '''
                         set -eu
-                        export GH_TOKEN
 
-                        PR_STATE=$(gh pr view "$PR_NUMBER" \
+                        export GH_REPO="$GITHUB_REPO"
+
+                        PR_NUMBER=$(gh pr list \
                             --repo "$GITHUB_REPO" \
-                            --json state \
-                            --jq '.state')
+                            --base main \
+                            --head feature \
+                            --state open \
+                            --json number \
+                            --jq '.[0].number // empty')
 
-                        echo "Pull request: $PR_URL"
-                        echo "Pull request state: $PR_STATE"
-
-                        if [ "$PR_STATE" != "OPEN" ]; then
-                            echo "Expected an open PR before merging."
-                            exit 1
-                        fi
-                    '''
-                }
-            }
-        }
-
-        stage('Auto Merge into main') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'github-token',
-                        variable: 'GH_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-                        export GH_TOKEN
-
-                        PR_STATE=$(gh pr view "$PR_NUMBER" \
-                            --repo "$GITHUB_REPO" \
-                            --json state \
-                            --jq '.state')
-
-                        if [ "$PR_STATE" = "MERGED" ]; then
-                            echo "PR #$PR_NUMBER is already merged."
-                        elif [ "$PR_STATE" = "OPEN" ]; then
-                            echo "Merging PR #$PR_NUMBER into main."
-
-                            gh pr merge "$PR_NUMBER" \
+                        if [ -z "$PR_NUMBER" ]; then
+                            PR_URL=$(gh pr create \
                                 --repo "$GITHUB_REPO" \
-                                --merge
+                                --base main \
+                                --head feature \
+                                --title "Update ${CONFIG_TYPE} configuration for ${ENVIRONMENT}" \
+                                --body "Automated configuration update generated by Jenkins build ${BUILD_NUMBER}.")
 
-                            echo "Merge command completed."
+                            echo "Created pull request: $PR_URL"
                         else
-                            echo "PR is not open. Current state: $PR_STATE"
-                            exit 1
+                            echo "Using existing open pull request #$PR_NUMBER"
                         fi
                     '''
                 }
             }
         }
 
-        stage('Verify main') {
+        stage('Validate Pull Request') {
             steps {
                 withCredentials([
                     string(
@@ -352,16 +271,93 @@ PY
                 ]) {
                     sh '''
                         set -eu
-                        export GH_TOKEN
+
+                        PR_NUMBER=$(gh pr list \
+                            --repo "$GITHUB_REPO" \
+                            --base main \
+                            --head feature \
+                            --state open \
+                            --json number \
+                            --jq '.[0].number // empty')
+
+                        if [ -z "$PR_NUMBER" ]; then
+                            echo "No open pull request found."
+                            exit 1
+                        fi
 
                         gh pr view "$PR_NUMBER" \
                             --repo "$GITHUB_REPO" \
-                            --json state,mergedAt,baseRefName \
-                            --jq '"State: \\(.state), target: \\(.baseRefName), mergedAt: \\(.mergedAt)"'
+                            --json state,baseRefName,headRefName \
+                            --jq '
+                              if .state == "OPEN"
+                                 and .baseRefName == "main"
+                                 and .headRefName == "feature"
+                              then
+                                "Pull request validation passed."
+                              else
+                                error("Pull request validation failed.")
+                              end
+                            '
+                    '''
+                }
+            }
+        }
 
-                        git fetch origin main
-                        echo "Latest main commit:"
-                        git log -1 --oneline origin/main
+        stage('Merge Pull Request') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        PR_NUMBER=$(gh pr list \
+                            --repo "$GITHUB_REPO" \
+                            --base main \
+                            --head feature \
+                            --state open \
+                            --json number \
+                            --jq '.[0].number // empty')
+
+                        if [ -z "$PR_NUMBER" ]; then
+                            echo "No open pull request to merge."
+                            exit 1
+                        fi
+
+                        gh pr merge "$PR_NUMBER" \
+                            --repo "$GITHUB_REPO" \
+                            --merge
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Merge') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'github-token',
+                        variable: 'GH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        gh pr list \
+                            --repo "$GITHUB_REPO" \
+                            --base main \
+                            --head feature \
+                            --state merged \
+                            --json number,mergedAt \
+                            --jq '
+                              if length > 0
+                              then "Merged pull request verified."
+                              else error("No merged pull request found for feature -> main.")
+                              end
+                            '
                     '''
                 }
             }
@@ -371,11 +367,10 @@ PY
     post {
         success {
             echo 'Pipeline completed successfully.'
-            echo 'Configuration was validated, analyzed, deployed, and the PR merge stage completed.'
         }
 
         failure {
-            echo 'Pipeline failed. Check the failed stage in the Jenkins console output.'
+            echo 'Pipeline failed. Check the stage logs above for the cause.'
         }
 
         always {
