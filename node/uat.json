@@ -1,6 +1,6 @@
 {
   "environment": "uat",
-  "nodeName": "node-01",
+  "nodeName": "node-02",
   "nodeType": "worker",
   "region": "us-east-1",
   "availabilityZone": "us-east-1a",
