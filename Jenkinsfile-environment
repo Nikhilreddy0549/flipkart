@@ -187,6 +187,12 @@ PY
                         )
                     ]) {
                         sh '''
+                            set -eu
+
+                            echo "Checking Nexus credential variables..." 
+                            test -n "$NEXUS_USERNAME" 
+                            test -n "$NEXUS_PASSWORD" 
+                            echo "Credential variables are available." 
                             mvn -s "$MAVEN_SETTINGS" deploy -DskipTests
                         '''
                     }
