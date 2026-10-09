@@ -16,5 +16,6 @@
   "features": {
     "debug": false,
     "maintenanceMode": false
-  }
+  },
+  "port": 5000
 }
