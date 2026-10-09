@@ -186,7 +186,6 @@ PY
                     )
                 ]) {
                     sh '''
-                        set -eu
                         mvn -s "$MAVEN_SETTINGS" deploy -DskipTests
                     '''
                 }
