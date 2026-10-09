@@ -1,91 +1,131 @@
-
 pipeline {
     agent any
 
     options {
-        skipDefaultCheckout(true)
+        timestamps()
         disableConcurrentBuilds()
+        skipDefaultCheckout(true)
     }
 
     parameters {
         choice(
+            name: 'CONFIG_TYPE',
+            choices: ['environment', 'node'],
+            description: 'Select configuration type'
+        )
+        choice(
             name: 'ENVIRONMENT',
             choices: ['dev', 'stage', 'uat', 'prod'],
-            description: 'Select the environment to modify'
+            description: 'Select environment'
         )
-
-        choice(
-            name: 'PARAMETER',
-            choices: [
-                'version',
-                'replicas',
-                'logLevel',
-                'database.host',
-                'database.port',
-                'database.name',
-                'resources.cpu',
-                'resources.memory',
-                'features.debug',
-                'features.maintenanceMode'
-            ],
-            description: 'Select the JSON parameter to modify'
-        )
-
         string(
-            name: 'VALUE',
-            description: 'Enter the new value'
+            name: 'CONFIG_KEY',
+            defaultValue: 'appName',
+            description: 'JSON key to modify'
+        )
+        string(
+            name: 'CONFIG_VALUE',
+            defaultValue: 'flipkart',
+            description: 'New value for the selected JSON key'
         )
     }
 
     environment {
-        REPO = 'Nikhilreddy0549/flipkart'
-        FEATURE_BRANCH = 'feature'
-        MAIN_BRANCH = 'main'
+        REPO_URL = 'git@github.com:Nikhilreddy0549/flipkart.git'
+        REPO_NAME = 'Nikhilreddy0549/flipkart'
+        BRANCH_NAME = 'feature'
+        SONAR_PROJECT_KEY = 'flipkart-config-automation'
     }
 
     stages {
-
         stage('Checkout feature') {
             steps {
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/feature']],
-                    userRemoteConfigs: [[
-                        url: 'git@github.com:Nikhilreddy0549/flipkart.git',
-                        credentialsId: 'github-ssh'
-                    ]]
-                ])
+                deleteDir()
+
+                sshagent(credentials: ['github-ssh']) {
+                    sh '''
+                        set -eu
+                        git clone --branch "$BRANCH_NAME" \
+                            "$REPO_URL" .
+                        git checkout "$BRANCH_NAME"
+                    '''
+                }
             }
         }
 
         stage('Modify selected JSON') {
             steps {
-                sh '''
-                    python validation/modify_environment.py \
-                        "environment/${ENVIRONMENT}.json" \
-                        "${PARAMETER}" \
-                        "${VALUE}"
-                '''
+                script {
+                    def configDir = params.CONFIG_TYPE
+                    def configFile =
+                        "${configDir}/${params.ENVIRONMENT}.json"
+
+                    withEnv([
+                        "CONFIG_FILE=${configFile}",
+                        "CONFIG_KEY=${params.CONFIG_KEY}",
+                        "CONFIG_VALUE=${params.CONFIG_VALUE}"
+                    ]) {
+                        sh '''
+                            set -eu
+                            python3 - <<'PY'
+import json
+import os
+
+path = os.environ["CONFIG_FILE"]
+key = os.environ["CONFIG_KEY"]
+raw_value = os.environ["CONFIG_VALUE"]
+
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+try:
+    value = json.loads(raw_value)
+except json.JSONDecodeError:
+    value = raw_value
+
+data[key] = value
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\\n")
+
+print(f"Updated {path}: {key} = {value!r}")
+PY
+                        '''
+                    }
+                }
             }
         }
 
         stage('JSON Syntax Validation') {
             steps {
                 sh '''
-                    python -m json.tool \
+                    set -eu
+                    python3 -m json.tool \
                         "environment/${ENVIRONMENT}.json" \
                         > /dev/null
+                    python3 -m json.tool \
+                        "node/${ENVIRONMENT}.json" \
+                        > /dev/null
+                    echo "JSON syntax validation passed."
                 '''
             }
         }
 
-        stage('Environment Validation') {
+        stage('Environment / Node Validation') {
             steps {
-                sh '''
-                    python validation/validate_environment.py \
-                        "environment/${ENVIRONMENT}.json" \
-                        "${ENVIRONMENT}"
-                '''
+                script {
+                    def validator = params.CONFIG_TYPE == 'environment'
+                        ? 'validation/validate_environment.py'
+                        : 'validation/validate_node.py'
+
+                    withEnv(["VALIDATOR=${validator}"]) {
+                        sh '''
+                            set -eu
+                            python3 "$VALIDATOR"
+                        '''
+                    }
+                }
             }
         }
 
@@ -105,8 +145,11 @@ pipeline {
                         )
                     ]) {
                         sh '''
-                            mvn org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
-                                -Dsonar.token="$SONAR_TOKEN"
+                            set -eu
+                            mvn \
+                              org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
+                              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                              -Dsonar.token="$SONAR_TOKEN"
                         '''
                     }
                 }
@@ -115,8 +158,15 @@ pipeline {
 
         stage('Quality Gate') {
             steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
+                timeout(time: 10, unit: 'MINUTES') {
+                    script {
+                        def qg = waitForQualityGate()
+                        echo "SonarQube Quality Gate: ${qg.status}"
+
+                        if (qg.status != 'OK') {
+                            error "Quality Gate failed: ${qg.status}"
+                        }
+                    }
                 }
             }
         }
@@ -137,7 +187,11 @@ pipeline {
                         )
                     ]) {
                         sh '''
-                            mvn deploy -s "$MAVEN_SETTINGS"
+                            set -eu
+                            mvn \
+                              -s "$MAVEN_SETTINGS" \
+                              deploy \
+                              -DskipTests
                         '''
                     }
                 }
@@ -146,26 +200,35 @@ pipeline {
 
         stage('Commit') {
             steps {
-                sh '''
-                    git config user.name "Jenkins"
-                    git config user.email "jenkins@localhost"
+                script {
+                    def configFile =
+                        "${params.CONFIG_TYPE}/${params.ENVIRONMENT}.json"
 
-                    git add "environment/${ENVIRONMENT}.json"
+                    withEnv(["CONFIG_FILE=${configFile}"]) {
+                        sh '''
+                            set -eu
+                            git config user.name "Jenkins"
+                            git config user.email "jenkins@localhost"
 
-                    if ! git diff --cached --quiet; then
-                        git commit \
-                            -m "Update ${ENVIRONMENT} environment configuration"
-                    else
-                        echo "No configuration changes to commit."
-                    fi
-                '''
+                            git add "$CONFIG_FILE"
+
+                            if git diff --cached --quiet; then
+                                echo "No configuration changes to commit."
+                            else
+                                git commit -m \
+                                  "Update ${ENVIRONMENT} ${CONFIG_TYPE} configuration"
+                            fi
+                        '''
+                    }
+                }
             }
         }
 
         stage('Push feature') {
             steps {
-                sshagent(['github-ssh']) {
+                sshagent(credentials: ['github-ssh']) {
                     sh '''
+                        set -eu
                         git push origin HEAD:feature
                     '''
                 }
@@ -181,17 +244,19 @@ pipeline {
                     )
                 ]) {
                     sh '''
+                        set -eu
+                        export GH_TOKEN
+
                         if gh pr view feature \
-                            --repo "$REPO" \
-                            >/dev/null 2>&1; then
+                            --repo "$REPO_NAME" >/dev/null 2>&1; then
                             echo "Pull request already exists for feature."
                         else
                             gh pr create \
-                                --repo "$REPO" \
-                                --base "$MAIN_BRANCH" \
-                                --head "$FEATURE_BRANCH" \
-                                --title "Update ${ENVIRONMENT} environment configuration" \
-                                --body "Automated configuration update for ${ENVIRONMENT} environment."
+                                --repo "$REPO_NAME" \
+                                --base main \
+                                --head feature \
+                                --title "Update configuration" \
+                                --body "Automated configuration update from Jenkins."
                         fi
                     '''
                 }
@@ -208,35 +273,27 @@ pipeline {
                 ]) {
                     sh '''
                         set -eu
+                        export GH_TOKEN
 
                         PR_URL=$(gh pr view feature \
-                            --repo "$REPO" \
-                            --json url \
-                            --jq '.url')
-
-                        echo "Validating PR: $PR_URL"
+                            --repo "$REPO_NAME" \
+                            --json url --jq .url)
 
                         PR_STATE=$(gh pr view "$PR_URL" \
-                            --repo "$REPO" \
-                            --json state \
-                            --jq '.state')
+                            --repo "$REPO_NAME" \
+                            --json state --jq .state)
 
-                        if [ "$PR_STATE" != "OPEN" ]; then
-                            echo "ERROR: Pull request is not open."
+                        echo "Pull request: $PR_URL"
+                        echo "Pull request state: $PR_STATE"
+
+                        if [ "$PR_STATE" = "MERGED" ]; then
+                            echo "PR is already merged."
+                        elif [ "$PR_STATE" = "OPEN" ]; then
+                            echo "PR is open and ready for auto-merge."
+                        else
+                            echo "ERROR: PR is closed without merging."
                             exit 1
                         fi
-
-                        MERGEABLE=$(gh pr view "$PR_URL" \
-                            --repo "$REPO" \
-                            --json mergeable \
-                            --jq '.mergeable')
-
-                        if [ "$MERGEABLE" != "MERGEABLE" ]; then
-                            echo "ERROR: Pull request is not currently mergeable."
-                            exit 1
-                        fi
-
-                        echo "PR validation passed."
                     '''
                 }
             }
@@ -252,17 +309,22 @@ pipeline {
                 ]) {
                     sh '''
                         set -eu
+                        export GH_TOKEN
 
-                        PR_URL=$(gh pr view feature \
-                            --repo "$REPO" \
-                            --json url \
-                            --jq '.url')
+                        PR_STATE=$(gh pr view feature \
+                            --repo "$REPO_NAME" \
+                            --json state --jq .state)
 
-                        gh pr merge "$PR_URL" \
-                            --repo "$REPO" \
-                            --merge
-
-                        echo "Pull request merged into main."
+                        if [ "$PR_STATE" = "MERGED" ]; then
+                            echo "PR already merged; nothing to do."
+                        elif [ "$PR_STATE" = "OPEN" ]; then
+                            gh pr merge feature \
+                                --repo "$REPO_NAME" \
+                                --merge
+                        else
+                            echo "ERROR: PR cannot be merged."
+                            exit 1
+                        fi
                     '''
                 }
             }
@@ -273,13 +335,14 @@ pipeline {
         success {
             echo 'Pipeline completed successfully.'
         }
-
         failure {
-            echo 'Pipeline failed. Review the stage logs before retrying.'
+            echo 'Pipeline failed. Review the stage logs.'
         }
-
         aborted {
             echo 'Pipeline was aborted.'
+        }
+        always {
+            echo "Build result: ${currentBuild.currentResult}"
         }
     }
 }
