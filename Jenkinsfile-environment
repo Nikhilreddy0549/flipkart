@@ -13,16 +13,19 @@ pipeline {
             choices: ['environment', 'node'],
             description: 'Select configuration type'
         )
+
         choice(
             name: 'ENVIRONMENT',
             choices: ['dev', 'stage', 'uat', 'prod'],
             description: 'Select environment'
         )
+
         string(
             name: 'CONFIG_KEY',
             defaultValue: 'appName',
             description: 'JSON key to modify'
         )
+
         string(
             name: 'CONFIG_VALUE',
             defaultValue: 'flipkart',
@@ -38,6 +41,7 @@ pipeline {
     }
 
     stages {
+
         stage('Checkout feature') {
             steps {
                 deleteDir()
@@ -56,9 +60,8 @@ pipeline {
         stage('Modify selected JSON') {
             steps {
                 script {
-                    def configDir = params.CONFIG_TYPE
                     def configFile =
-                        "${configDir}/${params.ENVIRONMENT}.json"
+                        "${params.CONFIG_TYPE}/${params.ENVIRONMENT}.json"
 
                     withEnv([
                         "CONFIG_FILE=${configFile}",
@@ -67,6 +70,7 @@ pipeline {
                     ]) {
                         sh '''
                             set -eu
+
                             python3 - <<'PY'
 import json
 import os
@@ -99,30 +103,41 @@ PY
 
         stage('JSON Syntax Validation') {
             steps {
-                sh '''
-                    set -eu
-                    python3 -m json.tool \
-                        "environment/${ENVIRONMENT}.json" \
-                        > /dev/null
-                    python3 -m json.tool \
-                        "node/${ENVIRONMENT}.json" \
-                        > /dev/null
-                    echo "JSON syntax validation passed."
-                '''
+                script {
+                    def configFile =
+                        "${params.CONFIG_TYPE}/${params.ENVIRONMENT}.json"
+
+                    withEnv(["CONFIG_FILE=${configFile}"]) {
+                        sh '''
+                            set -eu
+                            python3 -m json.tool "$CONFIG_FILE" > /dev/null
+                            echo "JSON syntax validation passed."
+                        '''
+                    }
+                }
             }
         }
 
         stage('Environment / Node Validation') {
             steps {
                 script {
-                    def validator = params.CONFIG_TYPE == 'environment'
+                    def validator =
+                        params.CONFIG_TYPE == 'environment'
                         ? 'validation/validate_environment.py'
                         : 'validation/validate_node.py'
 
-                    withEnv(["VALIDATOR=${validator}"]) {
+                    def configFile =
+                        "${params.CONFIG_TYPE}/${params.ENVIRONMENT}.json"
+
+                    withEnv([
+                        "VALIDATOR=${validator}",
+                        "CONFIG_FILE=${configFile}",
+                        "SELECTED_ENV=${params.ENVIRONMENT}"
+                    ]) {
                         sh '''
                             set -eu
-                            python3 "$VALIDATOR"
+                            python3 "$VALIDATOR" \
+                                "$CONFIG_FILE" "$SELECTED_ENV"
                         '''
                     }
                 }
@@ -188,10 +203,7 @@ PY
                     ]) {
                         sh '''
                             set -eu
-                            mvn \
-                              -s "$MAVEN_SETTINGS" \
-                              deploy \
-                              -DskipTests
+                            mvn -s "$MAVEN_SETTINGS" deploy -DskipTests
                         '''
                     }
                 }
@@ -207,6 +219,7 @@ PY
                     withEnv(["CONFIG_FILE=${configFile}"]) {
                         sh '''
                             set -eu
+
                             git config user.name "Jenkins"
                             git config user.email "jenkins@localhost"
 
@@ -335,12 +348,15 @@ PY
         success {
             echo 'Pipeline completed successfully.'
         }
+
         failure {
             echo 'Pipeline failed. Review the stage logs.'
         }
+
         aborted {
             echo 'Pipeline was aborted.'
         }
+
         always {
             echo "Build result: ${currentBuild.currentResult}"
         }
